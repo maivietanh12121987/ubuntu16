@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+check_host_ports.py
+===================
+
+Reads the Vast.ai host port range and verifies, for every port in that range,
+whether it is reachable from the *public internet* using portchecker.io.
+
+Why portchecker.io? It performs the TCP connection from its own server, i.e.
+from outside your network. That is exactly what you want when validating a
+GPU host: it tells you whether the firewall / NAT / port-forwarding actually
+exposes the port, not just whether something is bound locally.
+
+Per-port workflow
+-----------------
+  1. Try to open a temporary TCP listener on 0.0.0.0:<port>.
+       * bind succeeds  -> the port was free, WE created the listener.
+       * bind fails (address in use) -> something is already listening; we
+         leave it completely alone (we never created a socket for it).
+  2. Ask portchecker.io to connect to <public_ip>:<port> from the outside.
+  3. Print OPEN / CLOSED / ERROR.
+  4. Immediately close the temporary listener -- but only if WE created it.
+     Pre-existing listeners are never touched.
+
+At the end it prints a summary of every port that came back CLOSED.
+
+Notes
+-----
+* Stdlib only -- no pip install needed on the host.
+* Ports 1-1023 require root to bind. The Vast range (e.g. 4000-4100) does not.
+* A "closed" result means the external prober could not complete a TCP
+  handshake: usually a firewall block or missing NAT/port-forward mapping.
+* On NAT'd hosts the port the host listens on must match the externally
+  mapped port for the check to be meaningful.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+import time
+import os
+import random
+import re
+import shutil
+import subprocess
+import urllib.request
+import urllib.error
+from typing import Optional
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+PORT_RANGE_FILE = "/var/lib/vastai_kaalia/host_port_range"
+
+# portchecker.io request endpoint (current API, see https://portchecker.io/docs).
+#
+#   GET /api/{host}/{port}   -> text/plain "True" (open) or "False" (closed).
+#   The check is performed from portchecker.io's own server (external vantage).
+#   Use the literal host "me" to have the server auto-detect the requester's
+#   WAN IP (and, per the API docs, that request is not logged).
+#
+# If the route ever changes, update ONLY this template. {host} and {ports} are
+# substituted ({ports} is a single port for this GET endpoint).
+PORTCHECKER_URL_TEMPLATE = "https://portchecker.io/api/{host}/{ports}"
+
+# Endpoint that returns this host's public IP as seen by portchecker.io (text).
+PORTCHECKER_ME_URL = "https://portchecker.io/api/me"
+
+REQUEST_TIMEOUT = 15          # seconds to wait for the portchecker.io response
+DELAY_BETWEEN_CHECKS = 1.0    # seconds between requests (be kind to a free service)
+LISTEN_BACKLOG = 16
+USER_AGENT = "host-port-checker/1.0 (+vastai diagnostics)"
+
+# Services used to discover this host's public/WAN IP (plain-text IP responses).
+PUBLIC_IP_SERVICES = (
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+    "https://ipv4.icanhazip.com",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+def force_ipv4() -> None:
+    """
+    Force every outbound socket connection (and therefore every urllib
+    HTTP/HTTPS request) to use IPv4 only.
+
+    portchecker.io publishes both A and AAAA records. If Python happens to
+    connect over IPv6, the server's "me" auto-detection sees our IPv6 WAN
+    address and the port check is performed against the wrong address family
+    -- which is almost never what you want when validating an IPv4 GPU host.
+
+    We do this by wrapping socket.getaddrinfo so it only ever returns AF_INET
+    (IPv4) results. This applies globally, so all existing urllib calls in this
+    script honour it without any further changes.
+    """
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        # Ignore whatever family the caller asked for and force IPv4.
+        try:
+            return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        except socket.gaierror:
+            # IPv4-only resolution failed (e.g. an IPv6-only host). Fall back
+            # to the original behaviour so resolution still has a chance.
+            return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+
+def read_port_range(path: str) -> tuple[int, int]:
+    """Read 'START-END' (e.g. '4000-4100') from `path` and return (start, end)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = fh.read().strip()
+
+    if not raw:
+        raise ValueError(f"{path} is empty")
+
+    # Accept 'START-END' as well as a bare single port.
+    if "-" in raw:
+        start_s, _, end_s = raw.partition("-")
+        start, end = int(start_s.strip()), int(end_s.strip())
+    else:
+        start = end = int(raw)
+
+    if not (1 <= start <= 65535 and 1 <= end <= 65535):
+        raise ValueError(f"port range out of bounds (1-65535): {raw!r}")
+    if start > end:
+        start, end = end, start
+    return start, end
+
+
+def get_public_ip() -> Optional[str]:
+    """Best-effort discovery of this host's public IP as seen from the outside."""
+    for url in (PORTCHECKER_ME_URL, *PUBLIC_IP_SERVICES):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                ip = resp.read().decode("utf-8", "replace").strip()
+                if ip:
+                    return ip
+        except Exception:
+            continue
+    return None
+
+
+def open_listener_if_free(port: int) -> tuple[Optional[socket.socket], bool]:
+    """
+    Try to create a listening TCP socket on 0.0.0.0:<port>.
+
+    Returns (sock, created):
+      * (sock, True)  -> port was free; we now hold a LISTEN socket.
+      * (None, False) -> something already listening/bound; leave it alone.
+
+    A socket in LISTEN state completes the TCP handshake at the kernel level
+    even without accept(), so an external prober will see it as open.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", port))
+        sock.listen(LISTEN_BACKLOG)
+        return sock, True
+    except OSError as exc:
+        sock.close()
+        # EADDRINUSE (Linux errno 98) -> already in use by another listener.
+        return None, False
+
+
+# --------------------------------------------------------------------------- #
+# Discover which process is already listening on a port
+# --------------------------------------------------------------------------- #
+
+# Matches the `users:(("name",pid=1234,fd=7))` field of `ss -p` output.
+_SS_PID_RE = re.compile(r'\("(?P<name>[^"]+)",pid=(?P<pid>\d+)')
+
+
+def _pids_via_ss(port: int) -> Optional[list[tuple[str, int]]]:
+    """Use `ss -ltnp` to find listeners on `port`. None if `ss` is unavailable."""
+    if not shutil.which("ss"):
+        return None
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    found: list[tuple[str, int]] = []
+    for line in out.splitlines():
+        if "users:" not in line:
+            continue
+        for mt in _SS_PID_RE.finditer(line):
+            found.append((mt.group("name"), int(mt.group("pid"))))
+    return found
+
+
+def _pids_via_lsof(port: int) -> Optional[list[tuple[str, int]]]:
+    """Use `lsof` to find listeners on `port`. None if `lsof` is unavailable."""
+    if not shutil.which("lsof"):
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    found: list[tuple[str, int]] = []
+    pid: Optional[int] = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("c") and pid is not None:
+            found.append((line[1:], pid))
+    return found
+
+
+def _pids_via_proc(port: int) -> list[tuple[str, int]]:
+    """Pure-/proc fallback: map the listening socket's inode to a PID."""
+    inodes: set[str] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                next(fh, None)  # skip header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":  # 0A == LISTEN
+                        continue
+                    try:
+                        lport = int(parts[1].rsplit(":", 1)[1], 16)
+                    except ValueError:
+                        continue
+                    if lport == port:
+                        inodes.add(parts[9])
+        except FileNotFoundError:
+            continue
+    if not inodes:
+        return []
+
+    found: list[tuple[str, int]] = []
+    for pid_s in os.listdir("/proc"):
+        if not pid_s.isdigit():
+            continue
+        fd_dir = f"/proc/{pid_s}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    try:
+                        with open(f"/proc/{pid_s}/comm", encoding="utf-8") as cf:
+                            name = cf.read().strip()
+                    except OSError:
+                        name = "?"
+                    found.append((name, int(pid_s)))
+                    break
+        except (PermissionError, FileNotFoundError):
+            continue
+    return found
+
+
+def find_listening_pids(port: int) -> list[tuple[str, int]]:
+    """
+    Return [(process_name, pid), ...] for processes listening on `port`.
+
+    Tries `ss`, then `lsof`, then a /proc scan. An empty list means either
+    nothing was found or (more likely) we lack permission to see a process
+    owned by another user -- run with sudo to reveal those PIDs.
+    """
+    for finder in (_pids_via_ss, _pids_via_lsof, _pids_via_proc):
+        result = finder(port)
+        if result:
+            seen: set[int] = set()
+            unique: list[tuple[str, int]] = []
+            for name, pid in result:
+                if pid not in seen:
+                    seen.add(pid)
+                    unique.append((name, pid))
+            return unique
+    return []
+
+
+def format_listeners(pids: list[tuple[str, int]]) -> str:
+    """Human-readable listener string for the output line."""
+    if not pids:
+        return "pid unknown (run with sudo to see it)"
+    return ", ".join(f"{name} (pid {pid})" for name, pid in pids)
+
+
+def _extract_port_status(data: object, port: int) -> Optional[bool]:
+    """
+    Pull the open/closed verdict for `port` out of portchecker.io's JSON.
+
+    Tolerant of minor schema differences: understands 'connectable', 'open',
+    and 'status' fields, and recurses through dict/list structures. Returns
+    True (open), False (closed) or None (could not determine).
+    """
+    verdict: Optional[bool] = None
+
+    def truthy(v: object) -> Optional[bool]:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("open", "true", "connectable", "reachable", "1"):
+                return True
+            if s in ("closed", "false", "filtered", "unreachable", "0"):
+                return False
+        return None
+
+    def walk(node: object) -> None:
+        nonlocal verdict
+        if verdict is True:           # short-circuit: any address reporting open wins
+            return
+        if isinstance(node, dict):
+            # A result entry that names this port?
+            if node.get("port") in (port, str(port)):
+                for key in ("connectable", "open", "status", "is_open", "reachable"):
+                    if key in node:
+                        t = truthy(node[key])
+                        if t is not None:
+                            verdict = True if t else (verdict if verdict is True else False)
+                            if t:
+                                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return verdict
+
+
+def check_port_via_portchecker(host: str, port: int) -> str:
+    """
+    Ask portchecker.io whether host:port is reachable from the outside.
+    Returns 'open', 'closed', or 'error'.
+
+    The GET /api/{host}/{port} endpoint replies with plain text 'True'/'False'.
+    A JSON fallback is kept in case the endpoint is pointed at the POST API.
+    """
+    url = PORTCHECKER_URL_TEMPLATE.format(host=host, ports=port)
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/plain, application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as exc:
+        return f"error (HTTP {exc.code})"
+    except Exception as exc:                       # noqa: BLE001 - report and continue
+        return f"error ({exc.__class__.__name__})"
+
+    # Primary: plain-text "True"/"False".
+    low = body.lower()
+    if low in ("true", "open", "connectable", "reachable"):
+        return "open"
+    if low in ("false", "closed", "filtered", "unreachable"):
+        return "closed"
+
+    # Fallback: JSON body (e.g. POST /api/query schema {"check":[{"port","status"}]}).
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return f"error (unexpected: {body[:40]!r})"
+
+    status = _extract_port_status(data, port)
+    if status is True:
+        return "open"
+    if status is False:
+        return "closed"
+    return "error (no verdict)"
+
+
+# --------------------------------------------------------------------------- #
+# Port selection (random subset / single port / all)
+# --------------------------------------------------------------------------- #
+
+def select_random_ports(all_ports: list[int], count: int) -> list[int]:
+    """
+    Pick `count` ports at random from `all_ports`, but ALWAYS include the last
+    port of the range. Result is returned sorted ascending.
+
+      * count <= 1            -> just the last port.
+      * count >= len(all)     -> every port (nothing to sample).
+      * otherwise             -> last port + (count-1) random others, unique.
+    """
+    last = all_ports[-1]
+    if count >= len(all_ports):
+        return list(all_ports)
+    if count <= 1:
+        return [last]
+    pool = all_ports[:-1]                      # everything except the last port
+    extra = random.sample(pool, count - 1)     # unique, no repeats
+    return sorted(set(extra) | {last})
+
+
+def _parse_choice(raw: str) -> tuple[str, Optional[int]]:
+    """
+    Interpret an interactive selection string.
+
+    Returns one of:
+      ("all",   None)   -> check every port
+      ("count", N)      -> check N random ports (last port always included)
+      ("port",  P)      -> check the single specific port P
+      ("bad",   None)   -> could not understand the input
+    """
+    s = raw.strip()
+    if s == "":
+        return ("all", None)
+
+    # Specific port: "=4050", ":4050", "port 4050", "p4050".
+    m = re.fullmatch(r"[=:]\s*(\d+)", s) or re.fullmatch(r"(?:port|p)\s*(\d+)", s, re.I)
+    if m:
+        p = int(m.group(1))
+        if 1 <= p <= 65535:
+            return ("port", p)
+        return ("bad", None)
+
+    # A bare number is treated as a COUNT of random ports.
+    if s.isdigit():
+        n = int(s)
+        if n >= 1:
+            return ("count", n)
+    return ("bad", None)
+
+
+def prompt_for_selection(all_ports: list[int]) -> list[int]:
+    """Interactively ask the user which ports to check."""
+    start, end, total = all_ports[0], all_ports[-1], len(all_ports)
+    print(f"Port range: {start}-{end}  ({total} ports)")
+    print("What do you want to check?")
+    print("   [Enter]      -> ALL ports")
+    print(f"   a number N   -> N random ports (last port {end} always included)")
+    print(f"   =PORT        -> one specific port, e.g. ={end}")
+
+    while True:
+        try:
+            raw = input("Your choice: ")
+        except EOFError:
+            print("(no input -> checking ALL ports)")
+            return list(all_ports)
+
+        kind, value = _parse_choice(raw)
+        if kind == "all":
+            return list(all_ports)
+        if kind == "count":
+            chosen = select_random_ports(all_ports, value)
+            print(f"-> {len(chosen)} random port(s) selected "
+                  f"(last port {end} included).")
+            return chosen
+        if kind == "port":
+            if not (start <= value <= end):
+                print(f"   note: {value} is outside the range {start}-{end}, "
+                      f"checking it anyway.")
+            return [value]
+        print("   Invalid input. Enter a number (random count), '=PORT' for a "
+              "single port, or just press Enter for all.")
+
+
+def resolve_selection(all_ports: list[int], args: argparse.Namespace) -> Optional[list[int]]:
+    """
+    Decide which ports to check based on CLI flags, falling back to an
+    interactive prompt when running in a terminal, or to ALL otherwise.
+
+    Precedence: --port > --count > --all > interactive prompt > all.
+    Returns the sorted list of ports, or None on an invalid flag value.
+    """
+    if args.port is not None:
+        if not (1 <= args.port <= 65535):
+            print(f"ERROR: --port must be 1-65535 (got {args.port})", file=sys.stderr)
+            return None
+        if not (all_ports[0] <= args.port <= all_ports[-1]):
+            print(f"note: --port {args.port} is outside range "
+                  f"{all_ports[0]}-{all_ports[-1]}, checking it anyway.")
+        return [args.port]
+
+    if args.count is not None:
+        if args.count < 1:
+            print(f"ERROR: --count must be >= 1 (got {args.count})", file=sys.stderr)
+            return None
+        return select_random_ports(all_ports, args.count)
+
+    if args.all:
+        return list(all_ports)
+
+    # No explicit selection: prompt when interactive, else default to ALL.
+    if sys.stdin.isatty():
+        return prompt_for_selection(all_ports)
+    return list(all_ports)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main(argv: Optional[list[str]] = None) -> int:
+    global REQUEST_TIMEOUT
+    parser = argparse.ArgumentParser(
+        description="Check external reachability of the Vast.ai host port range "
+                    "via portchecker.io."
+    )
+    parser.add_argument("-f", "--file", default=PORT_RANGE_FILE,
+                        help=f"port-range file (default: {PORT_RANGE_FILE})")
+    parser.add_argument("--host", default=None,
+                        help="public IP/hostname to check; default auto-detects "
+                             "this host's WAN IP server-side via 'me'")
+    parser.add_argument("--start", type=int, default=None,
+                        help="override start port (skip file)")
+    parser.add_argument("--end", type=int, default=None,
+                        help="override end port (skip file)")
+    parser.add_argument("--delay", type=float, default=DELAY_BETWEEN_CHECKS,
+                        help=f"seconds between checks (default: {DELAY_BETWEEN_CHECKS})")
+    parser.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT,
+                        help=f"request timeout seconds (default: {REQUEST_TIMEOUT})")
+    parser.add_argument("--allow-ipv6", action="store_true",
+                        help="allow requests over IPv6 (default: force IPv4 only, "
+                             "so portchecker.io always probes the IPv4 WAN address)")
+    parser.add_argument("-n", "--count", type=int, default=None,
+                        help="check only N random ports from the range "
+                             "(the last port is always included)")
+    parser.add_argument("-p", "--port", type=int, default=None,
+                        help="check a single specific port")
+    parser.add_argument("--all", action="store_true",
+                        help="check every port in the range (skip the prompt)")
+    args = parser.parse_args(argv)
+
+    REQUEST_TIMEOUT = args.timeout
+
+    # Force all outbound connections (urllib -> portchecker.io, IP lookups) to
+    # IPv4 unless the user explicitly opts into IPv6.
+    if not args.allow_ipv6:
+        force_ipv4()
+
+    # 1) Resolve the port range.
+    if args.start is not None and args.end is not None:
+        start, end = min(args.start, args.end), max(args.start, args.end)
+    else:
+        try:
+            start, end = read_port_range(args.file)
+        except FileNotFoundError:
+            print(f"ERROR: port-range file not found: {args.file}", file=sys.stderr)
+            return 2
+        except (ValueError, OSError) as exc:
+            print(f"ERROR: could not read port range: {exc}", file=sys.stderr)
+            return 2
+
+    all_ports = list(range(start, end + 1))
+
+    # 1b) Decide which ports to actually check (all / random subset / one port).
+    ports = resolve_selection(all_ports, args)
+    if ports is None:
+        return 2
+    if not ports:
+        print("No ports selected.", file=sys.stderr)
+        return 2
+
+    # 2) Resolve the host to test against.
+    #    - explicit --host: check that host directly (URL is logged server-side).
+    #    - default: use "me" so portchecker.io auto-detects our WAN IP (not logged);
+    #      we still fetch the IP via /api/me purely for display.
+    if args.host:
+        check_host = args.host
+        display_ip = args.host
+    else:
+        check_host = "me"
+        display_ip = get_public_ip() or "auto-detect (me)"
+
+    print(f"Port range : {start}-{end}  ({len(all_ports)} ports total)")
+    if len(ports) != len(all_ports):
+        print(f"Checking   : {len(ports)} selected port(s) -> "
+              f"{', '.join(str(p) for p in ports)}")
+    else:
+        print(f"Checking   : all {len(ports)} ports")
+    print(f"Public host: {display_ip}")
+    print(f"Endpoint   : {PORTCHECKER_URL_TEMPLATE.format(host=check_host, ports='<port>')}")
+    print("-" * 60)
+
+    closed_ports: list[int] = []
+    error_ports: list[int] = []
+    preexisting_list: list[tuple[int, str]] = []
+    open_count = 0
+    created_count = 0
+    preexisting_count = 0
+
+    try:
+        for i, port in enumerate(ports):
+            sock, created = open_listener_if_free(port)
+            listener_suffix = ""
+            if created:
+                created_count += 1
+                origin = "opened by script"
+            else:
+                preexisting_count += 1
+                origin = "already listening"
+                listeners = format_listeners(find_listening_pids(port))
+                listener_suffix = f"  [{listeners}]"
+                preexisting_list.append((port, listeners))
+
+            try:
+                status = check_port_via_portchecker(check_host, port)
+            finally:
+                # Close ONLY what we created; never touch pre-existing listeners.
+                if sock is not None:
+                    sock.close()
+
+            if status == "open":
+                open_count += 1
+                mark = "OPEN  "
+            elif status == "closed":
+                closed_ports.append(port)
+                mark = "CLOSED"
+            else:
+                error_ports.append(port)
+                mark = "ERR   "
+
+            print(f"  port {port:<6} [{origin:>17}]  -> {mark} ({status}){listener_suffix}")
+
+            # Be polite to the free service (skip the wait after the last port).
+            if args.delay and i < len(ports) - 1:
+                time.sleep(args.delay)
+    except KeyboardInterrupt:
+        print("\nInterrupted - any script-created listeners have been closed.",
+              file=sys.stderr)
+        # sockets created in the current iteration are closed in the finally above;
+        # earlier iterations were already closed each loop.
+        return 130
+
+    # 3) Summary.
+    print("-" * 60)
+    print("Summary")
+    print(f"  total checked      : {len(ports)}")
+    print(f"  open               : {open_count}")
+    print(f"  closed             : {len(closed_ports)}")
+    print(f"  errors/undetermined: {len(error_ports)}")
+    print(f"  listeners created  : {created_count}")
+    print(f"  already listening  : {preexisting_count}")
+
+    if closed_ports:
+        print("\nCLOSED ports (not reachable from the public internet):")
+        print("  " + ", ".join(str(p) for p in closed_ports))
+    else:
+        print("\nNo closed ports detected.")
+
+    if error_ports:
+        print("\nPorts with errors / no verdict (re-check these):")
+        print("  " + ", ".join(str(p) for p in error_ports))
+
+    if preexisting_list:
+        print("\nAlready-listening ports (left untouched):")
+        for port, listeners in preexisting_list:
+            print(f"  port {port}: {listeners}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
